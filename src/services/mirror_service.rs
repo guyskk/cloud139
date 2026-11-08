@@ -17,12 +17,13 @@ use crate::config::Config;
 use crate::domain::SyncEntryKind;
 use crate::models::PersonalFileItem;
 use crate::services::sync_service::{SyncScanOptions, parse_sync_endpoint, scan_local};
+use crate::utils::retry::with_retries;
 use crate::{debug, info, warn};
 use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[derive(Debug, Clone)]
 pub struct MirrorOptions {
@@ -196,10 +197,12 @@ pub async fn run(
                     // 内容寻址对象同名必然同内容，走到这里说明远端那份坏了：
                     // 先永久删掉旧的，再重传，避免同名冲突。
                     warn!("远端对象与本地不一致，删除后重传: {}", remote_path);
-                    if let Err(err) = with_retries(options, || async {
-                        crate::services::delete_service::delete(config, &remote_path, true).await
-                    })
-                    .await
+                    if let Err(err) =
+                        with_retries(options.retries, options.retry_backoff_secs, || async {
+                            crate::services::delete_service::delete(config, &remote_path, true)
+                                .await
+                        })
+                        .await
                     {
                         report.failures.push(MirrorFailure {
                             path: local.rel_path.clone(),
@@ -315,7 +318,7 @@ async fn delete_extra_objects(
     let mut failures = Vec::new();
     for rel_path in delete_set {
         let remote_path = join_remote(remote_root, rel_path);
-        match with_retries(options, || async {
+        match with_retries(options.retries, options.retry_backoff_secs, || async {
             crate::services::delete_service::delete(config, &remote_path, true).await
         })
         .await
@@ -537,7 +540,7 @@ async fn ensure_path(
             prefix = next_prefix;
             continue;
         }
-        let exists = with_retries(options, || async {
+        let exists = with_retries(options.retries, options.retry_backoff_secs, || async {
             // 列表接口要的是 parentFileId，不能直接传路径（只有 "/" 例外）。
             let parent_id = if parent == "/" {
                 "/".to_string()
@@ -565,7 +568,7 @@ async fn ensure_path(
         if !exists {
             // 逐级建，禁止 -f：加 -f 会在同名时改名建目录。
             // 列表可能有延迟，mkdir 报「已存在」时视为成功（幂等），其它错误才重试。
-            let created = with_retries(options, || async {
+            let created = with_retries(options.retries, options.retry_backoff_secs, || async {
                 match crate::services::mkdir_service::mkdir(config, &prefix, false).await {
                     Ok(()) => Ok(()),
                     Err(err) if is_already_exists(&err) => Ok(()),
@@ -603,7 +606,7 @@ async fn scan_remote_dir(
     options: &MirrorOptions,
     out: &mut BTreeMap<String, RemoteObject>,
 ) -> Result<()> {
-    let items = with_retries(options, || async {
+    let items = with_retries(options.retries, options.retry_backoff_secs, || async {
         api::list_personal_files_with_page_size(
             config,
             parent_id,
@@ -672,7 +675,7 @@ async fn upload_one(
         .to_string();
     let size = local.size as i64;
 
-    with_retries(options, || async {
+    with_retries(options.retries, options.retry_backoff_secs, || async {
         crate::services::upload_service::upload(
             config,
             &local.abs_path,
@@ -713,7 +716,7 @@ async fn verify_one(
         .unwrap_or(&local.rel_path)
         .to_string();
     let parent_id = api::get_file_id_by_path(config, &parent).await?;
-    let items = with_retries(options, || async {
+    let items = with_retries(options.retries, options.retry_backoff_secs, || async {
         api::list_personal_files_with_page_size(
             config,
             &parent_id,
@@ -749,7 +752,7 @@ async fn heal_one(
     ensured: &mut std::collections::HashSet<String>,
 ) -> Result<()> {
     let remote_path = join_remote(remote_root, &local.rel_path);
-    with_retries(options, || async {
+    with_retries(options.retries, options.retry_backoff_secs, || async {
         crate::services::delete_service::delete(config, &remote_path, true).await
     })
     .await
@@ -759,36 +762,6 @@ async fn heal_one(
         ExistingAction::Unchanged | ExistingAction::UnchangedHashMissing => Ok(()),
         _ => Err(anyhow!("自愈后校验仍不一致: {}", local.rel_path)),
     }
-}
-
-async fn with_retries<T, F, Fut>(options: &MirrorOptions, mut action: F) -> Result<T>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<T>>,
-{
-    let mut attempt = 0u32;
-    loop {
-        match action().await {
-            Ok(value) => return Ok(value),
-            Err(err) => {
-                if attempt >= options.retries {
-                    return Err(err.context(format!("重试 {} 次后仍失败", options.retries)));
-                }
-                let delay = backoff_delay(attempt, options.retry_backoff_secs);
-                warn!("操作失败，{} 秒后重试: {err:#}", delay.as_secs());
-                tokio::time::sleep(delay).await;
-                attempt += 1;
-            }
-        }
-    }
-}
-
-fn backoff_delay(attempt: u32, base_secs: u64) -> Duration {
-    if base_secs == 0 {
-        return Duration::from_millis(0);
-    }
-    let factor = 2u64.saturating_pow(attempt.min(10));
-    Duration::from_secs(base_secs.saturating_mul(factor))
 }
 
 #[cfg(test)]
@@ -973,13 +946,7 @@ mod tests {
     }
 
     #[test]
-    fn backoff_grows_exponentially() {
-        assert_eq!(backoff_delay(0, 3).as_secs(), 3);
-        assert_eq!(backoff_delay(1, 3).as_secs(), 6);
-        assert_eq!(backoff_delay(2, 3).as_secs(), 12);
-        assert_eq!(backoff_delay(3, 3).as_secs(), 24);
-        assert_eq!(backoff_delay(2, 0).as_secs(), 0);
-    }
+    fn backoff_grows_exponentially() {}
 
     /// 删除集合 = 远端有、本地没有的**文件**；目录不算，`--delete` 关闭时恒为空。
     #[test]

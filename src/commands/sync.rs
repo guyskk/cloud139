@@ -1,4 +1,4 @@
-use crate::commands::CommandExit;
+use crate::commands::{CommandExit, exit_code_for_error};
 use crate::domain::StorageType;
 use crate::domain::{SyncDirection, SyncEndpoint};
 use crate::services::sync_executor::{SyncExecuteOptions, execute_sync_actions};
@@ -70,11 +70,12 @@ pub async fn execute(args: SyncArgs) -> anyhow::Result<()> {
             SyncEndpoint::Local(local_root),
             SyncEndpoint::Cloud(cloud_root),
         ) => {
+            // 扫描失败按性质给退出码：网络抖动 → 1（可重试），路径/配置错 → 2。
             let source = scan_local(&local_root, scan_options.clone())
-                .map_err(|err| CommandExit::new(2, err.to_string()))?;
+                .map_err(|err| CommandExit::new(exit_code_for_error(&err), err.to_string()))?;
             let target = scan_cloud_personal(&config, &cloud_root, scan_options)
                 .await
-                .map_err(|err| CommandExit::new(2, err.to_string()))?;
+                .map_err(|err| CommandExit::new(exit_code_for_error(&err), err.to_string()))?;
             (source, target, local_root, cloud_root)
         }
         (
@@ -84,10 +85,10 @@ pub async fn execute(args: SyncArgs) -> anyhow::Result<()> {
         ) => {
             let source = scan_cloud_personal(&config, &cloud_root, scan_options.clone())
                 .await
-                .map_err(|err| CommandExit::new(2, err.to_string()))?;
+                .map_err(|err| CommandExit::new(exit_code_for_error(&err), err.to_string()))?;
             let target = if local_root.exists() {
                 scan_local(&local_root, scan_options)
-                    .map_err(|err| CommandExit::new(2, err.to_string()))?
+                    .map_err(|err| CommandExit::new(exit_code_for_error(&err), err.to_string()))?
             } else {
                 Vec::new()
             };
