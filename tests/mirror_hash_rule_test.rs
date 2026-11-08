@@ -122,6 +122,8 @@ async fn regular_file_without_remote_hash_is_failure() {
     // 内容寻址对象缺哈希不判失败，只计入 hashMissing
     assert_eq!(report.hash_missing, 1);
     assert_eq!(report.skipped, 1);
+    // 没有任何修复：healed 必须为 0（旧口径会把它算成「远端已有仓 → 自愈」）
+    assert_eq!(report.healed, 0);
 
     // 只有目录列举，没有任何上传/删除请求
     root.assert_calls(1);
@@ -171,8 +173,44 @@ async fn conflict_handling_depends_on_content_addressing() {
         "实际: {}",
         report.failures[0].error
     );
-    // 内容寻址那份走「重传」，不是失败
+    // 内容寻址那份走「重传」，不是失败；这是真正的修复，计入 healed
     assert_eq!(report.uploaded, 1);
+    assert_eq!(report.healed, 1, "远端坏对象被重传 = 修复");
+
+    root.assert_calls(1);
+    repo.assert_calls(1);
+    data.assert_calls(1);
+    aa.assert_calls(1);
+}
+
+/// 正常的一夜：远端没有这个新对象 → 只算 uploaded，`healed` 必须是 0。
+/// （旧口径「远端已有仓时任何上传都算 self-heal」会让正常夜也报 `healed=N`，是假警报源。）
+#[tokio::test]
+async fn new_object_is_uploaded_but_not_healed() {
+    let server = MockServer::start();
+    let addressed = "d".repeat(64);
+    let root = mock_list(&server, "/", vec![folder("id-repo", "repo")]);
+    let repo = mock_list(&server, "id-repo", vec![folder("id-data", "data")]);
+    let data = mock_list(&server, "id-data", vec![folder("id-aa", "aa")]);
+    // 远端 data/aa 是空的：本地的对象是「新增」
+    let aa = mock_list(&server, "id-aa", vec![]);
+
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), &format!("data/aa/{addressed}"), &[9u8; 12]);
+
+    let report = mirror_service::run(
+        &config_for(&server),
+        tmp.path().to_str().unwrap(),
+        "cloud:/repo",
+        &options_dry_run(),
+    )
+    .await
+    .expect("dry-run 不该变成致命错误");
+
+    assert_eq!(report.objects, 1);
+    assert_eq!(report.uploaded, 1, "新对象要上传");
+    assert_eq!(report.healed, 0, "新对象不是修复，不能计入 healed");
+    assert!(report.failures.is_empty());
 
     root.assert_calls(1);
     repo.assert_calls(1);

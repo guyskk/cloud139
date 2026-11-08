@@ -44,6 +44,8 @@ pub struct MirrorReport {
     pub skipped: usize,
     pub verified: usize,
     pub hash_missing: usize,
+    /// 本轮**修复**的对象数：远端本来有、内容不符，删掉重传后复核通过。
+    /// 新对象只计入 `uploaded`——正常夜里这里应当是 0，非 0 才需要看。
     pub healed: usize,
     pub remote_only: usize,
     pub bytes_uploaded: u64,
@@ -127,7 +129,11 @@ pub async fn run(
                     error,
                     retries: 0,
                 }),
-                ExistingAction::Reupload => report.uploaded += 1,
+                ExistingAction::Reupload => {
+                    // 远端本来有、内容不符：这是一次计划中的修复，不是新对象。
+                    report.uploaded += 1;
+                    report.healed += 1;
+                }
             }
         }
         report.remote_only = count_remote_only(&remote, &locals);
@@ -138,12 +144,12 @@ pub async fn run(
     let mut ensured = std::collections::HashSet::new();
     ensure_path(config, &remote_root, options, &mut ensured).await?;
     let remote = scan_remote(config, &remote_root, options).await?;
-    // 远端本来就有东西时，补回/修好的对象算「自愈」；首次铺设不算。
-    let repo_preexisting = !remote.is_empty();
 
     for local in &locals {
         let remote_path = join_remote(&remote_root, &local.rel_path);
         let existing = remote.get(&local.rel_path);
+        // 只有「远端本来有、内容不符 → 删掉重传」才算修复；新对象只计入 uploaded。
+        let mut replaced_broken_object = false;
 
         if let Some(entry) = existing {
             match classify_existing(local, entry, options.verify) {
@@ -184,6 +190,7 @@ pub async fn run(
                         });
                         continue;
                     }
+                    replaced_broken_object = true;
                 }
             }
         }
@@ -192,8 +199,7 @@ pub async fn run(
             Ok(bytes) => {
                 report.uploaded += 1;
                 report.bytes_uploaded += bytes;
-                if repo_preexisting {
-                    // 远端原本有仓，这个对象是缺了或坏了被补回来的
+                if replaced_broken_object {
                     report.healed += 1;
                 }
                 if options.verify {
@@ -231,7 +237,8 @@ pub async fn run(
                                 }
                             }
                             if healed {
-                                // 已经在 uploaded 分支计过数，这里不重复累加
+                                // 上传后复核不一致、重传后修好：这也是修复，不只是新上传。
+                                report.healed += 1;
                             } else {
                                 report.failures.push(MirrorFailure {
                                     path: local.rel_path.clone(),
