@@ -31,6 +31,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Cp(args) => cloud139::commands::cp::execute(args).await,
         Commands::Rename(args) => cloud139::commands::rename::execute(args).await,
         Commands::Sync(args) => cloud139::commands::sync::execute(args).await,
+        Commands::Mirror(args) => cloud139::commands::mirror::execute(args).await,
     };
 
     if let Err(err) = result {

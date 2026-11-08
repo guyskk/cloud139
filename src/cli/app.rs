@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-use crate::commands::{cp, delete, download, list, login, mkdir, mv, rename, sync, upload};
+use crate::commands::{cp, delete, download, list, login, mirror, mkdir, mv, rename, sync, upload};
 
 #[derive(Parser)]
 #[command(name = "cloud139")]
@@ -41,4 +41,6 @@ pub enum Commands {
     Rename(rename::RenameArgs),
     /// 同步本地目录和云端目录
     Sync(sync::SyncArgs),
+    /// 把本地仓推到云端（只增不删）
+    Mirror(mirror::MirrorArgs),
 }
