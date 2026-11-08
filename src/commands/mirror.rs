@@ -87,6 +87,15 @@ pub async fn execute(args: MirrorArgs) -> anyhow::Result<()> {
         }
     }
 
+    // 本地仓根不存在属于参数错误（exit 2），不能混进「对象失败」的 1。
+    if !std::path::Path::new(&args.local).is_dir() {
+        return Err(CommandExit::new(
+            2,
+            format!("本地仓根不存在或不是目录: {}", args.local),
+        )
+        .into());
+    }
+
     let config = crate::config::Config::load().map_err(|err| {
         CommandExit::new(2, format!("读取配置失败: {err}"))
     })?;
@@ -105,9 +114,33 @@ pub async fn execute(args: MirrorArgs) -> anyhow::Result<()> {
         args.local, args.remote, args.verify, args.dry_run
     );
 
-    let report = mirror_service::run(&config, &args.local, &args.remote, &options)
-        .await
-        .map_err(|err| CommandExit::new(1, format!("{err:#}")))?;
+    let report = match mirror_service::run(&config, &args.local, &args.remote, &options).await {
+        Ok(report) => report,
+        Err(err) => {
+            // 契约：失败也要给调用方一份可解析的汇总（44659 用它写 latest.json）。
+            let message = format!("{err:#}");
+            if args.json {
+                let fatal = serde_json::json!({
+                    "objects": 0,
+                    "uploaded": 0,
+                    "skipped": 0,
+                    "verified": 0,
+                    "hashMissing": 0,
+                    "healed": 0,
+                    "remoteOnly": 0,
+                    "bytesUploaded": 0,
+                    "seconds": 0.0,
+                    "failures": [{
+                        "path": args.local,
+                        "error": message,
+                        "retries": 0
+                    }]
+                });
+                println!("{}", fatal);
+            }
+            return Err(CommandExit::new(1, message).into());
+        }
+    };
 
     if args.json {
         println!("{}", serde_json::to_string(&report)?);
