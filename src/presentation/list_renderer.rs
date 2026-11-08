@@ -54,6 +54,15 @@ pub struct JsonFileItem {
     pub file_type: String,
     pub size: i64,
     pub modified: String,
+    /// 个人云文件的内容哈希；服务端没给（家庭云/群组/文件夹）时省略字段。
+    #[serde(rename = "contentHash", skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+    /// 统一大写（服务端返回小写 sha256），便于消费方按 "SHA256" 判断。
+    #[serde(
+        rename = "contentHashAlgorithm",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub content_hash_algorithm: Option<String>,
 }
 
 pub fn to_json(result: &ListResult) -> anyhow::Result<String> {
@@ -76,6 +85,11 @@ pub fn to_json_with_pagination(
             },
             size: item.size,
             modified: item.modified.clone(),
+            content_hash: item.content_hash.clone(),
+            content_hash_algorithm: item
+                .content_hash_algorithm
+                .as_ref()
+                .map(|algorithm| algorithm.to_uppercase()),
         })
         .collect::<Vec<_>>();
 
