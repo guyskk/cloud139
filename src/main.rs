@@ -12,6 +12,11 @@ async fn main() -> anyhow::Result<()> {
     }
     cloud139::utils::logger::init_verbose(&cli.verbose);
 
+    // mirror --json：stdout 只留给汇总 JSON，日志（含续期/重试告警）一律走 stderr。
+    if let Commands::Mirror(args) = &cli.command {
+        cloud139::utils::logger::set_json_mode(args.json);
+    }
+
     // 除登录外的命令，启动时按需续期。139 的 refresh 接口每次滚动发放 30 天有效的新 token，
     // 所以只要 CLI 每天被调用，就不需要额外的定时任务来维持登录态。
     if !matches!(&cli.command, Commands::Login(_))

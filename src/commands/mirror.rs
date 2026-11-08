@@ -15,6 +15,7 @@ use std::io::IsTerminal;
 - 其它文件名 = 普通文件；同名但内容不同、或远端拿不到 contentHash 时**记失败并退出 1**，不覆盖、不删除远端对象（路径配错时靠这条拦住，避免写坏别人的仓库）。\n\
 - 普通文件缺哈希不会降级为「按相同处理」：证明不了相同就报错，这是有意的。\n\n\
 远端仓根不存在时会逐级创建（不会用 mkdir -f 改名）。\n\n\
+--json 时 stdout 只输出这一行 JSON，其余日志（含重试告警、上传进度行）全部走 stderr，调用方可以直接解析 stdout。\n\n\
 退出码：0 全部成功；1 有对象失败（继续处理其它对象后统一返回）；2 参数或配置错误。"
 )]
 pub struct MirrorArgs {
@@ -37,7 +38,10 @@ pub struct MirrorArgs {
     #[arg(long, help = "只算差异，不发任何写请求")]
     pub dry_run: bool,
 
-    #[arg(long, help = "输出 JSON 汇总（失败时也会输出）")]
+    #[arg(
+        long,
+        help = "输出 JSON 汇总（失败时也会输出）；此时 stdout 只有 JSON，日志走 stderr"
+    )]
     pub json: bool,
 
     #[arg(long, default_value_t = 100, value_name = "N", help = "列目录每页条数")]
@@ -69,6 +73,8 @@ pub struct MirrorArgs {
 }
 
 pub async fn execute(args: MirrorArgs) -> anyhow::Result<()> {
+    // 直接调用本命令时也保证 stdout 干净（main 已在分发前开过一次）。
+    crate::utils::logger::set_json_mode(args.json);
     validate_args(&args)?;
 
     let config = crate::config::Config::load()
