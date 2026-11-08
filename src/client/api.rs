@@ -89,8 +89,6 @@ pub async fn get_file_id_by_path(config: &Config, path: &str) -> Result<String, 
     }
 
     debug!("get_file_id_by_path: 解析路径={}", path);
-    let mut config = config.clone();
-    let host = get_personal_cloud_host(&mut config).await?;
 
     let parts: Vec<&str> = path
         .trim_start_matches('/')
@@ -108,23 +106,11 @@ pub async fn get_file_id_by_path(config: &Config, path: &str) -> Result<String, 
             current_parent_id.clone()
         };
 
-        let url = format!("{}/file/list", host);
-
-        let body = serde_json::json!({
-            "parentFileId": parent_id,
-            "pageInfo": {
-                "pageCursor": "",
-                "pageSize": 100
-            },
-            "orderBy": "updated_at",
-            "orderDirection": "DESC"
-        });
-
-        let list_resp: crate::models::PersonalListResp =
-            personal_api_request(&config, &url, body, crate::domain::StorageType::PersonalNew)
-                .await?;
-
-        let items = list_resp.data.map(|d| d.items).unwrap_or_default();
+        // 父目录可能有几百个子项（restic 的 data/ 就是 256 个），必须翻页找全；
+        // list_personal_files_with_client 已经按 nextPageCursor 翻完，直接复用，
+        // 避免这里再维护一份翻页逻辑。
+        let items =
+            list_personal_files_with_client(config, &parent_id, &HttpClientWrapper::new()).await?;
 
         let target_id = items
             .into_iter()

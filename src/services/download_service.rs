@@ -67,28 +67,18 @@ async fn download_personal(
         "/".to_string()
     };
 
-    let list_url = format!("{}/file/list", host);
-    let list_body = serde_json::json!({
-        "parentFileId": parent_id,
-        "pageInfo": {
-            "pageCursor": "",
-            "pageSize": 100
-        },
-        "orderBy": "updated_at",
-        "orderDirection": "DESC"
-    });
-    let list_resp: crate::models::PersonalListResp = crate::client::api::personal_api_request(
+    // 父目录可能超过一页（>100 个子项），必须翻页找全再判断目标是不是目录，
+    // 否则第 101 个之后的目录会被漏判、继续走下载流程。
+    let items = crate::client::api::list_personal_files_with_client(
         &config,
-        &list_url,
-        list_body,
-        StorageType::PersonalNew,
+        &parent_id,
+        &crate::client::api::HttpClientWrapper::new(),
     )
     .await?;
 
-    if let Some(items) = list_resp.data.map(|d| d.items)
-        && let Some(item) = items
-            .iter()
-            .find(|item| item.name.as_deref() == Some(file_name))
+    if let Some(item) = items
+        .iter()
+        .find(|item| item.name.as_deref() == Some(file_name))
         && (item.file_type.as_deref() == Some("1")
             || item.file_type.as_deref() == Some("folder")
             || item.file_type.as_deref() == Some("dir"))
