@@ -10,8 +10,12 @@ use std::io::IsTerminal;
     about = "把本地目录推到云端仓（只增不删，不删除远端已有对象）",
     long_about = "把本地目录推到云端仓：进程内完成遍历、差集、上传、校验、自愈。\n\n\
 **只增不删**：远端有、本地没有的对象不会被删除（append-only），只在 JSON 的 remoteOnly 里报告数量。\n\n\
+按文件名分流（不假定仓的类型）：\n\
+- 文件名是 64 位十六进制 = 内容寻址对象，名字即内容 sha256；远端同名但大小/哈希不一致，说明远端那份坏了，删掉重传（自愈，次数由 --heal 限制）。\n\
+- 其它文件名 = 普通文件；同名但内容不同、或远端拿不到 contentHash 时**记失败并退出 1**，不覆盖、不删除远端对象（路径配错时靠这条拦住，避免写坏别人的仓库）。\n\
+- 普通文件缺哈希不会降级为「按相同处理」：证明不了相同就报错，这是有意的。\n\n\
 远端仓根不存在时会逐级创建（不会用 mkdir -f 改名）。\n\n\
-退出码：0 全部成功；1 有对象失败；2 参数或配置错误。"
+退出码：0 全部成功；1 有对象失败（继续处理其它对象后统一返回）；2 参数或配置错误。"
 )]
 pub struct MirrorArgs {
     #[arg(help = "本地仓根目录，例如 /var/lib/beecodeai-backup/restic")]
@@ -90,14 +94,14 @@ pub async fn execute(args: MirrorArgs) -> anyhow::Result<()> {
             // 契约：失败也要给调用方一份可解析的汇总（44659 用它写 latest.json）。
             let message = format!("{err:#}");
             if args.json {
-                println!("{}", fatal_report_json(&args.local, &message));
+                crate::print!("{}", fatal_report_json(&args.local, &message));
             }
             return Err(CommandExit::new(1, message).into());
         }
     };
 
     if args.json {
-        println!("{}", serde_json::to_string(&report)?);
+        crate::print!("{}", serde_json::to_string(&report)?);
     } else {
         info!(
             "对象 {} 个：上传 {}、跳过 {}、校验 {}、缺哈希 {}、自愈 {}、远端独有 {}、上传 {} 字节、耗时 {:.1}s",
@@ -140,14 +144,13 @@ pub fn validate_args(args: &MirrorArgs) -> Result<(), CommandExit> {
         return Err(CommandExit::new(
             2,
             "暂不支持 --jobs > 1：并发往同一父目录写会因翻页漂移漏对象，请保持串行（默认 1）",
-        )
-        .into());
+        ));
     }
     if args.page_size <= 0 || args.page_size > 1000 {
-        return Err(CommandExit::new(2, "--page-size 必须在 1..=1000 之间".to_string()).into());
+        return Err(CommandExit::new(2, "--page-size 必须在 1..=1000 之间"));
     }
     if args.retry_backoff > 600 {
-        return Err(CommandExit::new(2, "--retry-backoff 不能超过 600 秒".to_string()).into());
+        return Err(CommandExit::new(2, "--retry-backoff 不能超过 600 秒"));
     }
 
     match parse_sync_endpoint(&args.remote) {
@@ -155,17 +158,17 @@ pub fn validate_args(args: &MirrorArgs) -> Result<(), CommandExit> {
         crate::domain::SyncEndpoint::Local(_) => {
             return Err(CommandExit::new(
                 2,
-                "远端必须是 cloud:/path 形式，例如 cloud:/beecodeai-backup/prod/restic".to_string(),
-            )
-            .into());
+                "远端必须是 cloud:/path 形式，例如 cloud:/beecodeai-backup/prod/restic",
+            ));
         }
     }
 
     // 本地仓根不存在属于参数错误（exit 2），不能混进「对象失败」的 1。
     if !std::path::Path::new(&args.local).is_dir() {
-        return Err(
-            CommandExit::new(2, format!("本地仓根不存在或不是目录: {}", args.local)).into(),
-        );
+        return Err(CommandExit::new(
+            2,
+            format!("本地仓根不存在或不是目录: {}", args.local),
+        ));
     }
     Ok(())
 }

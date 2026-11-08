@@ -41,6 +41,7 @@ pub enum Commands {
     Rename(rename::RenameArgs),
     /// 同步本地目录和云端目录
     Sync(sync::SyncArgs),
-    /// 把本地仓推到云端（只增不删）
+    // 说明留在 MirrorArgs 的 about / long_about：这里的文档注释会覆盖它们，
+    // 所以 mirror 这个子命令刻意不写注释（否则 --help 只剩一行摘要）。
     Mirror(mirror::MirrorArgs),
 }

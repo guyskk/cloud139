@@ -6,8 +6,8 @@
 //! - 校验按 size + contentHash（统一小写比对）；缺哈希只计入 hashMissing，不判失败。
 //! - 失败也要输出完整 JSON，由调用方写 latest.json。
 
-use crate::client::api::{self, HttpClientWrapper};
 use crate::client::ClientError;
+use crate::client::api::{self, HttpClientWrapper};
 use crate::config::Config;
 use crate::domain::SyncEntryKind;
 use crate::models::PersonalFileItem;
@@ -62,9 +62,14 @@ struct LocalObject {
     rel_path: String,
     abs_path: PathBuf,
     size: u64,
-    /// 期望的内容 sha256：内容寻址对象用文件名，`config` 现算。
-    expected_sha256: Option<String>,
+    /// 期望的内容 sha256：内容寻址对象用文件名，其它文件现算本地文件。
+    expected_sha256: String,
 }
+
+/// 普通文件同名不同内容：拒绝覆盖（路径配错时靠这条拦住，不能写坏别人的仓）。
+const ERR_CONTENT_DIFFERS: &str = "远端同名但内容不同，拒绝覆盖";
+/// 普通文件拿不到远端哈希：无法证明相同，按失败处理，不能静默放过。
+const ERR_HASH_UNAVAILABLE: &str = "远端未返回 contentHash，无法确认内容相同";
 
 #[derive(Debug, Clone)]
 struct RemoteObject {
@@ -102,11 +107,27 @@ pub async fn run(
             Err(err) => return Err(err),
         };
         for local in &locals {
-            match remote.get(&local.rel_path) {
-                Some(entry) if !needs_upload(local, entry, options.verify) => {
-                    report.skipped += 1;
+            let entry = match remote.get(&local.rel_path) {
+                Some(entry) => entry,
+                None => {
+                    report.uploaded += 1;
+                    continue;
                 }
-                _ => report.uploaded += 1,
+            };
+            match classify_existing(local, entry, options.verify) {
+                ExistingAction::Unchanged => report.skipped += 1,
+                ExistingAction::UnchangedHashMissing => {
+                    // 口径与正式跑一致：演练也要反映「有多少对象只能靠文件名保证」。
+                    report.skipped += 1;
+                    report.hash_missing += 1;
+                }
+                // 演练只报告「正式跑会失败」，便于一次看全，不中断。
+                ExistingAction::Fail(error) => report.failures.push(MirrorFailure {
+                    path: local.rel_path.clone(),
+                    error,
+                    retries: 0,
+                }),
+                ExistingAction::Reupload => report.uploaded += 1,
             }
         }
         report.remote_only = count_remote_only(&remote, &locals);
@@ -125,32 +146,45 @@ pub async fn run(
         let existing = remote.get(&local.rel_path);
 
         if let Some(entry) = existing {
-            if !needs_upload(local, entry, options.verify) {
-                report.skipped += 1;
-                if options.verify && entry.content_hash.is_some() {
-                    report.verified += 1;
+            match classify_existing(local, entry, options.verify) {
+                ExistingAction::Unchanged => {
+                    report.skipped += 1;
+                    if options.verify {
+                        report.verified += 1;
+                    }
+                    continue;
                 }
-                if options.verify && entry.content_hash.is_none() {
+                ExistingAction::UnchangedHashMissing => {
+                    report.skipped += 1;
                     report.hash_missing += 1;
+                    continue;
                 }
-                continue;
-            }
-            // 同名但内容不同：内容寻址对象同名必然同内容，走到这里说明远端那份坏了。
-            // 先永久删掉旧的，再重传，避免同名冲突。
-            warn!("远端对象与本地不一致，删除后重传: {}", remote_path);
-            if let Err(err) = with_retries(options, || async {
-                crate::services::delete_service::delete(config, &remote_path, true)
+                // 「整轮失败」= 记一条失败后继续处理其它对象，最后统一返回 1。
+                ExistingAction::Fail(error) => {
+                    report.failures.push(MirrorFailure {
+                        path: local.rel_path.clone(),
+                        error,
+                        retries: 0,
+                    });
+                    continue;
+                }
+                ExistingAction::Reupload => {
+                    // 内容寻址对象同名必然同内容，走到这里说明远端那份坏了：
+                    // 先永久删掉旧的，再重传，避免同名冲突。
+                    warn!("远端对象与本地不一致，删除后重传: {}", remote_path);
+                    if let Err(err) = with_retries(options, || async {
+                        crate::services::delete_service::delete(config, &remote_path, true).await
+                    })
                     .await
-                    .map_err(anyhow::Error::from)
-            })
-            .await
-            {
-                report.failures.push(MirrorFailure {
-                    path: local.rel_path.clone(),
-                    error: format!("删除旧对象失败: {err:#}"),
-                    retries: options.retries,
-                });
-                continue;
+                    {
+                        report.failures.push(MirrorFailure {
+                            path: local.rel_path.clone(),
+                            error: format!("删除旧对象失败: {err:#}"),
+                            retries: options.retries,
+                        });
+                        continue;
+                    }
+                }
             }
         }
 
@@ -164,13 +198,22 @@ pub async fn run(
                 }
                 if options.verify {
                     match verify_one(config, &remote_root, local, options).await {
-                        Ok(VerifyOutcome::Ok) => report.verified += 1,
-                        Ok(VerifyOutcome::HashMissing) => {
+                        Ok(ExistingAction::Unchanged) => report.verified += 1,
+                        Ok(ExistingAction::UnchangedHashMissing) => {
                             report.verified += 1;
                             report.hash_missing += 1;
                         }
-                        Ok(VerifyOutcome::Mismatch) | Err(_) => {
-                            // 自愈：删远端→重传→复核
+                        // 普通文件拿不到哈希：刚传上去也证明不了内容相同，按失败处理。
+                        Ok(ExistingAction::Fail(error)) => {
+                            report.failures.push(MirrorFailure {
+                                path: local.rel_path.clone(),
+                                error,
+                                retries: 0,
+                            });
+                        }
+                        Ok(ExistingAction::Reupload) | Err(_) => {
+                            // 自愈：删远端→重传→复核。此刻对象刚由本进程创建，
+                            // 删重传不会动到别人的数据（同名普通文件的冲突已在上面拦掉）。
                             let mut healed = false;
                             for attempt in 0..options.heal {
                                 debug!(
@@ -179,7 +222,10 @@ pub async fn run(
                                     options.heal,
                                     local.rel_path
                                 );
-                                if heal_one(config, &remote_root, local, options, &mut ensured).await.is_ok() {
+                                if heal_one(config, &remote_root, local, options, &mut ensured)
+                                    .await
+                                    .is_ok()
+                                {
                                     healed = true;
                                     break;
                                 }
@@ -208,12 +254,6 @@ pub async fn run(
     report.remote_only = count_remote_only(&remote, &locals);
     report.seconds = started.elapsed().as_secs_f64();
     Ok(report)
-}
-
-enum VerifyOutcome {
-    Ok,
-    HashMissing,
-    Mismatch,
 }
 
 fn scan_local_objects(root: &Path) -> Result<Vec<LocalObject>> {
@@ -250,19 +290,24 @@ fn scan_local_objects(root: &Path) -> Result<Vec<LocalObject>> {
     Ok(objects)
 }
 
-/// restic 的对象名就是内容 sha256；`config` 是例外，需要现算。
-fn expected_sha256(rel_path: &str, abs_path: &Path) -> Result<Option<String>> {
+/// 文件名是 64 位十六进制 → 内容寻址对象，名字本身就是内容 sha256。
+///
+/// 这条规则不写死任何仓的类型：内容寻址的对象（数据块、index、keys、snapshots）
+/// 都天然满足，非内容寻址的（例如 restic 的 `config`）自然落到「普通文件」。
+fn is_content_addressed(rel_path: &str) -> bool {
     let name = rel_path.rsplit('/').next().unwrap_or(rel_path);
-    if rel_path == "config" {
-        let hash = crate::utils::crypto::calc_file_sha256(&abs_path.to_string_lossy())
-            .map_err(|err| anyhow!("计算 config 的 sha256 失败: {err}"))?;
-        return Ok(Some(hash.to_lowercase()));
+    name.len() == 64 && name.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// 期望的内容 sha256：内容寻址对象用文件名（统一小写），其它文件现算本地 sha256。
+fn expected_sha256(rel_path: &str, abs_path: &Path) -> Result<String> {
+    if is_content_addressed(rel_path) {
+        let name = rel_path.rsplit('/').next().unwrap_or(rel_path);
+        return Ok(name.to_lowercase());
     }
-    if name.len() == 64 && name.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Ok(Some(name.to_lowercase()));
-    }
-    // 不是内容寻址对象（例如未来新增的元数据文件），不做哈希比对。
-    Ok(None)
+    let hash = crate::utils::crypto::calc_file_sha256(&abs_path.to_string_lossy())
+        .map_err(|err| anyhow!("计算 {} 的 sha256 失败: {err}", rel_path))?;
+    Ok(hash.to_lowercase())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -273,12 +318,20 @@ enum HashCheck {
     Unavailable,
 }
 
-fn check_hash(remote_hash: Option<&str>, algorithm: Option<&str>, expected: &str) -> HashCheck {
-    let algorithm_is_sha256 = algorithm
+fn is_sha256_algorithm(algorithm: Option<&str>) -> bool {
+    algorithm
         .map(|value| value.trim().eq_ignore_ascii_case("SHA256"))
-        .unwrap_or(false);
+        .unwrap_or(false)
+}
+
+/// 远端给了可比的 SHA256（有哈希且算法是 SHA256）。
+fn has_comparable_hash(remote: &RemoteObject) -> bool {
+    remote.content_hash.is_some() && is_sha256_algorithm(remote.content_hash_algorithm.as_deref())
+}
+
+fn check_hash(remote_hash: Option<&str>, algorithm: Option<&str>, expected: &str) -> HashCheck {
     match remote_hash {
-        Some(actual) if algorithm_is_sha256 => {
+        Some(actual) if is_sha256_algorithm(algorithm) => {
             if hash_matches(actual, expected) {
                 HashCheck::Match
             } else {
@@ -309,17 +362,48 @@ fn needs_upload(local: &LocalObject, remote: &RemoteObject, verify: bool) -> boo
     if !verify {
         return false;
     }
-    match &local.expected_sha256 {
-        Some(expected) => matches!(
-            check_hash(
-                remote.content_hash.as_deref(),
-                remote.content_hash_algorithm.as_deref(),
-                expected
-            ),
-            HashCheck::Mismatch
+    matches!(
+        check_hash(
+            remote.content_hash.as_deref(),
+            remote.content_hash_algorithm.as_deref(),
+            &local.expected_sha256
         ),
-        None => false,
+        HashCheck::Mismatch
+    )
+}
+
+/// 远端已有同名对象时的处置。dry-run、正式运行、上传后复核共用这一处判据。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExistingAction {
+    /// 已确认一致，跳过（verify 开启时计入 verified）。
+    Unchanged,
+    /// 远端没给 SHA256，但对象是文件名寻址的，有第二层保证：跳过并计入 hashMissing。
+    UnchangedHashMissing,
+    /// 不能确认或已确认不同：记一条失败，绝不动远端。
+    Fail(String),
+    /// 内容寻址对象同名不同内容（远端那份坏了）：删掉重传。
+    Reupload,
+}
+
+fn classify_existing(local: &LocalObject, remote: &RemoteObject, verify: bool) -> ExistingAction {
+    let content_addressed = is_content_addressed(&local.rel_path);
+    // 同名的是目录，或大小/哈希对不上，都是冲突。
+    if remote.is_folder || needs_upload(local, remote, verify) {
+        return if content_addressed {
+            ExistingAction::Reupload
+        } else {
+            ExistingAction::Fail(ERR_CONTENT_DIFFERS.to_string())
+        };
     }
+    if verify && !has_comparable_hash(remote) {
+        // 内容寻址对象还有「名字=哈希」这层保证；普通文件没有，缺哈希就不能当相同放过。
+        return if content_addressed {
+            ExistingAction::UnchangedHashMissing
+        } else {
+            ExistingAction::Fail(ERR_HASH_UNAVAILABLE.to_string())
+        };
+    }
+    ExistingAction::Unchanged
 }
 
 fn hash_matches(remote_hash: &str, expected: &str) -> bool {
@@ -399,10 +483,7 @@ async fn ensure_path(
             )
             .await
             .map_err(anyhow::Error::from)?;
-            let names: Vec<String> = items
-                .iter()
-                .filter_map(|item| item.name.clone())
-                .collect();
+            let names: Vec<String> = items.iter().filter_map(|item| item.name.clone()).collect();
             debug!("mirror: 列 {parent} 得到 {} 项: {:?}", names.len(), names);
             Ok(items
                 .iter()
@@ -547,12 +628,13 @@ fn parent_remote_path(path: &str) -> String {
     }
 }
 
+/// 上传后复核：把远端这份按同一套判据再分类一次。
 async fn verify_one(
     config: &Config,
     remote_root: &str,
     local: &LocalObject,
     options: &MirrorOptions,
-) -> Result<VerifyOutcome> {
+) -> Result<ExistingAction> {
     let remote_path = join_remote(remote_root, &local.rel_path);
     let parent = parent_remote_path(&remote_path);
     let file_name = local
@@ -579,21 +661,15 @@ async fn verify_one(
         .find(|item| item.name.as_deref() == Some(file_name.as_str()))
         .ok_or_else(|| anyhow!("上传后远端找不到对象: {remote_path}"))?;
 
-    if item.size.unwrap_or(0) != local.size as i64 {
-        return Ok(VerifyOutcome::Mismatch);
-    }
-    match &local.expected_sha256 {
-        Some(expected) => match check_hash(
-            item.content_hash.as_deref(),
-            item.content_hash_algorithm.as_deref(),
-            expected,
-        ) {
-            HashCheck::Match => Ok(VerifyOutcome::Ok),
-            HashCheck::Mismatch => Ok(VerifyOutcome::Mismatch),
-            HashCheck::Unavailable => Ok(VerifyOutcome::HashMissing),
-        },
-        None => Ok(VerifyOutcome::Ok),
-    }
+    let remote = RemoteObject {
+        file_id: item.file_id.clone().unwrap_or_default(),
+        size: item.size.unwrap_or(0),
+        content_hash: item.content_hash.clone(),
+        content_hash_algorithm: item.content_hash_algorithm.clone(),
+        is_folder: is_folder(item),
+    };
+    // verify=true：刚上传成功，内容必须能证明与本地一致。
+    Ok(classify_existing(local, &remote, true))
 }
 
 async fn heal_one(
@@ -605,16 +681,14 @@ async fn heal_one(
 ) -> Result<()> {
     let remote_path = join_remote(remote_root, &local.rel_path);
     with_retries(options, || async {
-        crate::services::delete_service::delete(config, &remote_path, true)
-            .await
-            .map_err(anyhow::Error::from)
+        crate::services::delete_service::delete(config, &remote_path, true).await
     })
     .await
     .ok();
     upload_one(config, local, remote_root, options, ensured).await?;
     match verify_one(config, remote_root, local, options).await? {
-        VerifyOutcome::Mismatch => Err(anyhow!("自愈后校验仍不一致: {}", local.rel_path)),
-        _ => Ok(()),
+        ExistingAction::Unchanged | ExistingAction::UnchangedHashMissing => Ok(()),
+        _ => Err(anyhow!("自愈后校验仍不一致: {}", local.rel_path)),
     }
 }
 
@@ -652,12 +726,12 @@ fn backoff_delay(attempt: u32, base_secs: u64) -> Duration {
 mod tests {
     use super::*;
 
-    fn local(rel: &str, size: u64, sha: Option<&str>) -> LocalObject {
+    fn local(rel: &str, size: u64, sha: &str) -> LocalObject {
         LocalObject {
             rel_path: rel.to_string(),
             abs_path: PathBuf::from(rel),
             size,
-            expected_sha256: sha.map(|value| value.to_string()),
+            expected_sha256: sha.to_string(),
         }
     }
 
@@ -671,6 +745,16 @@ mod tests {
         }
     }
 
+    /// 64 位十六进制文件名（内容寻址对象的形状）。
+    fn sha(c: char) -> String {
+        c.to_string().repeat(64)
+    }
+
+    /// 大小写混合的 64 位十六进制。
+    fn sha_mixed_case() -> String {
+        format!("{}{}", "A".repeat(32), "b".repeat(32))
+    }
+
     #[test]
     fn hash_compare_is_case_insensitive() {
         assert!(hash_matches("ABCDEF", "abcdef"));
@@ -678,43 +762,109 @@ mod tests {
         assert!(!hash_matches("abc", "abd"));
     }
 
+    /// 分类只看文件名：64 位十六进制即内容寻址，大小写都算，其余一律普通文件。
+    #[test]
+    fn content_addressed_is_64_hex_file_name() {
+        assert!(is_content_addressed(&format!("data/aa/{}", sha('a'))));
+        assert!(is_content_addressed(&sha('A')));
+        assert!(is_content_addressed(&sha_mixed_case()));
+        assert!(is_content_addressed(&format!("index/{}", sha('0'))));
+        // 63 / 65 位、非 hex、普通名字都不是内容寻址
+        assert!(!is_content_addressed(&sha('a')[..63]));
+        assert!(!is_content_addressed(&format!("{}{}", sha('a'), "a")));
+        assert!(!is_content_addressed(&"g".repeat(64)));
+        assert!(!is_content_addressed("config"));
+        assert!(!is_content_addressed("data/aa/config"));
+    }
+
+    /// 内容寻址对象用文件名当期望哈希（统一小写），不需要读文件。
+    #[test]
+    fn expected_hash_comes_from_file_name() {
+        let name = sha_mixed_case();
+        let hash = expected_sha256(&format!("data/ab/{name}"), Path::new("/nonexistent/x"))
+            .expect("内容寻址不读文件");
+        assert_eq!(hash, name.to_lowercase());
+    }
+
     #[test]
     fn skip_when_size_and_hash_match() {
-        let item = local("data/aa/abc", 10, Some("abcdef"));
+        let item = local("data/aa/abc", 10, "abcdef");
         let existing = remote(10, Some("ABCDEF"), Some("SHA256"), false);
         assert!(!needs_upload(&item, &existing, true));
+        assert_eq!(
+            classify_existing(&item, &existing, true),
+            ExistingAction::Unchanged
+        );
     }
 
     #[test]
     fn upload_when_size_differs() {
-        let item = local("data/aa/abc", 11, Some("abcdef"));
+        let item = local("data/aa/abc", 11, "abcdef");
         let existing = remote(10, Some("abcdef"), Some("SHA256"), false);
         assert!(needs_upload(&item, &existing, true));
     }
 
     #[test]
     fn upload_when_hash_differs() {
-        let item = local("data/aa/abc", 10, Some("abcdef"));
+        let item = local("data/aa/abc", 10, "abcdef");
         let existing = remote(10, Some("000000"), Some("SHA256"), false);
         assert!(needs_upload(&item, &existing, true));
     }
 
-    /// 契约：远端没哈希时按「缺哈希」处理，尺寸一致就跳过、计入 hashMissing，
-    /// 不判失败也不反复重传（否则每轮都会重传）。
+    /// 内容寻址对象：同名不同内容 = 远端那份坏了，可以删掉重传（自愈）。
     #[test]
-    fn skip_when_remote_hash_missing_but_size_matches() {
-        let item = local("data/aa/abc", 10, Some("abcdef"));
-        let existing = remote(10, None, None, false);
-        assert!(!needs_upload(&item, &existing, true));
+    fn content_addressed_conflict_is_reuploaded() {
+        let item = local(&format!("data/aa/{}", sha('a')), 10, &sha('a'));
+        let existing = remote(10, Some(&sha('b')), Some("SHA256"), false);
         assert_eq!(
-            check_hash(None, None, "abcdef"),
-            HashCheck::Unavailable
+            classify_existing(&item, &existing, true),
+            ExistingAction::Reupload
+        );
+        // 尺寸不同同理
+        let existing = remote(11, Some(&sha('a')), Some("SHA256"), false);
+        assert_eq!(
+            classify_existing(&item, &existing, true),
+            ExistingAction::Reupload
+        );
+    }
+
+    /// 普通文件：同名但内容不同 —— 拒绝覆盖，绝不动远端。
+    #[test]
+    fn regular_file_conflict_is_refused() {
+        let item = local("config", 29, "abcdef");
+        let existing = remote(29, Some("000000"), Some("SHA256"), false);
+        assert_eq!(
+            classify_existing(&item, &existing, true),
+            ExistingAction::Fail(ERR_CONTENT_DIFFERS.to_string())
+        );
+        // 大小不同同样拒绝（不能靠覆盖去「修正」别人的仓）
+        let existing = remote(38, Some("abcdef"), Some("SHA256"), false);
+        assert_eq!(
+            classify_existing(&item, &existing, true),
+            ExistingAction::Fail(ERR_CONTENT_DIFFERS.to_string())
+        );
+    }
+
+    /// 缺哈希：内容寻址对象还有「名字=哈希」这层保证；普通文件没有，必须失败。
+    #[test]
+    fn missing_remote_hash_depends_on_content_addressing() {
+        let addressed = local(&format!("data/aa/{}", sha('a')), 10, &sha('a'));
+        let existing = remote(10, None, None, false);
+        assert_eq!(
+            classify_existing(&addressed, &existing, true),
+            ExistingAction::UnchangedHashMissing
+        );
+
+        let regular = local("config", 10, "abcdef");
+        assert_eq!(
+            classify_existing(&regular, &existing, true),
+            ExistingAction::Fail(ERR_HASH_UNAVAILABLE.to_string())
         );
     }
 
     #[test]
     fn algorithm_must_be_sha256_for_comparison() {
-        let item = local("data/aa/abc", 10, Some("abcdef"));
+        let item = local("data/aa/abc", 10, "abcdef");
         // 算法不是 SHA256：无法比对，按不可用处理，不重传
         let other_alg = remote(10, Some("000000"), Some("MD5"), false);
         assert!(!needs_upload(&item, &other_alg, true));
@@ -731,16 +881,26 @@ mod tests {
 
     #[test]
     fn upload_when_remote_is_folder() {
-        let item = local("data/aa/abc", 10, Some("abcdef"));
+        let item = local("data/aa/abc", 10, "abcdef");
         let existing = remote(0, None, None, true);
         assert!(needs_upload(&item, &existing, true));
+        // 普通文件遇到同名目录也只能记失败，不能删别人的目录
+        assert_eq!(
+            classify_existing(&item, &existing, true),
+            ExistingAction::Fail(ERR_CONTENT_DIFFERS.to_string())
+        );
     }
 
     #[test]
     fn verify_disabled_only_compares_size() {
-        let item = local("data/aa/abc", 10, Some("abcdef"));
+        let item = local("data/aa/abc", 10, "abcdef");
         let existing = remote(10, Some("000000"), Some("SHA256"), false);
         assert!(!needs_upload(&item, &existing, false));
+        // 关掉校验就不做哈希判断，也不会因为普通文件缺哈希而失败
+        assert_eq!(
+            classify_existing(&item, &existing, false),
+            ExistingAction::Unchanged
+        );
     }
 
     #[test]
@@ -759,7 +919,7 @@ mod tests {
         remote_map.insert("data/aa".to_string(), remote(0, None, None, true));
         remote_map.insert("data/aa/x".to_string(), remote(1, None, None, false));
         remote_map.insert("extra".to_string(), remote(2, None, None, false));
-        let locals = vec![local("data/aa/x", 1, Some("aa"))];
+        let locals = vec![local("data/aa/x", 1, "aa")];
         // 只有 extra 是远端独有文件；data / data/aa 是目录，不算
         assert_eq!(count_remote_only(&remote_map, &locals), 1);
     }
